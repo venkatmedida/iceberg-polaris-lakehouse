@@ -1,18 +1,18 @@
-# Building a Bidirectional Iceberg Lakehouse with Apache Polaris, Spark, and Snowflake
+# Unlocking Snowflake for AI Analytics with Open Iceberg and Apache Polaris
 
-*Open-source catalog, two compute engines, one table — zero credential sprawl*
+*How organizations can extend Snowflake's analytical power across any compute engine — without duplicating data*
+
+**Full source code: [github.com/venkatmedida/iceberg-polaris-lakehouse](https://github.com/venkatmedida/iceberg-polaris-lakehouse)**
 
 ---
 
-## The Problem
+## The Enterprise Challenge
 
-Modern data platforms need to serve multiple engines from the same data. A Spark pipeline writes raw events; a Snowflake analyst queries aggregations; another Spark job runs maintenance. Traditionally this required either data duplication or brittle ETL pipelines between systems.
+Snowflake is where organizations run their most critical analytical workloads — dashboards, revenue reporting, customer 360, and increasingly, AI feature stores and ML pipelines. But modern data platforms rarely live inside a single engine. Spark pipelines ingest and transform raw data at scale; Python notebooks run feature engineering; specialized ML runtimes train models. Each of these produces data that Snowflake analysts and AI applications need to consume — and traditionally that meant one of two painful options: duplicate the data into Snowflake, or maintain fragile ETL pipelines that lag behind.
 
-Apache Iceberg solves the storage side. What's been missing is a neutral, open catalog that any engine can talk to — so that a row written by Spark is immediately visible to Snowflake without a copy.
+Apache Iceberg changes the storage model. What this post adds is the missing piece: **a self-hosted [Apache Polaris](https://polaris.apache.org/) instance as the neutral Iceberg REST catalog**, so that Snowflake can read and write the same table that Spark is writing to — in real time, from the same parquet files, without any data movement. Snowflake becomes a first-class citizen of an open lakehouse where every engine's commit is immediately visible to every other.
 
-This post walks through exactly that: a self-hosted [Apache Polaris](https://polaris.apache.org/) instance acting as the Iceberg REST catalog, with PySpark and Snowflake both reading and writing the same table, seeing each other's commits as native Iceberg snapshots.
-
-All code is at: **https://github.com/venkatmedida/iceberg-polaris-lakehouse**
+For organizations already invested in Snowflake for AI analytics, this architecture means your feature pipelines, ML training jobs, and data science workflows running on Spark can feed data directly into Snowflake — as native Iceberg snapshots that Snowflake queries as if they were its own managed tables.
 
 ---
 
@@ -23,31 +23,33 @@ All code is at: **https://github.com/venkatmedida/iceberg-polaris-lakehouse**
 │                        Apache Polaris 1.5.0                     │
 │                    (Iceberg REST Catalog — Docker)              │
 │                                                                 │
-│   • Namespace + table registry                                  │
+│   • Single source of truth for table metadata + snapshots       │
 │   • OAuth2 client credentials (PRINCIPAL_ROLE:ALL scope)        │
 │   • Azure credential vending (rawdl-scoped SAS tokens)          │
 └────────────────────┬──────────────────────┬─────────────────────┘
                      │  REST + OAuth2        │  REST + OAuth2
-                     │                       │  + X-Iceberg-Access-
-                     │                       │    Delegation: vended-credentials
+                     │                       │  + VENDED_CREDENTIALS
           ┌──────────┴──────────┐   ┌────────┴──────────────────────┐
-          │     PySpark 3.5     │   │        Snowflake              │
+          │     PySpark 3.5     │   │     Snowflake (Horizon)       │
           │                     │   │                               │
-          │  • write_iceberg.py │   │  CATALOG INTEGRATION          │
-          │  • read_iceberg.py  │   │    VENDED_CREDENTIALS         │
-          │  • maintenance.py   │   │  LINKED_CATALOG               │
-          │  HadoopFileIO       │   │    (auto-discovers schemas     │
-          │  ClientCreds OAuth  │   │     and tables from Polaris)  │
+          │  Feature pipelines  │   │  AI Analytics / BI / SQL      │
+          │  ML training data   │   │  CATALOG INTEGRATION          │
+          │  Data ingestion      │   │    VENDED_CREDENTIALS         │
+          │  Table maintenance  │   │  LINKED_CATALOG               │
+          │                     │   │  (auto-discovers all tables   │
+          │                     │   │   written by any engine)      │
           └──────────┬──────────┘   └────────┬──────────────────────┘
                      │                        │
                      └───────────┬────────────┘
                                  │ abfss://
                     ┌────────────┴────────────┐
                     │   Azure ADLS Gen2        │
-                    │   (Parquet + Iceberg     │
-                    │    metadata files)       │
+                    │   Shared Parquet files   │
+                    │   + Iceberg metadata     │
                     └─────────────────────────┘
 ```
+
+Every engine — Spark, Snowflake, or any other Iceberg-compatible runtime — reads and writes directly to ADLS. Polaris is the single catalog that tracks what exists and where. There is no copy, no sync job, no pipeline between engines.
 
 ---
 
@@ -56,17 +58,17 @@ All code is at: **https://github.com/venkatmedida/iceberg-polaris-lakehouse**
 | Component | Version | Role |
 |-----------|---------|------|
 | Apache Polaris | 1.5.0 | Iceberg REST catalog (Docker) |
-| PySpark | 3.5.3 | Write, read, maintenance |
+| PySpark | 3.5.3 | Data ingestion, feature prep, maintenance |
 | `iceberg-spark-runtime` | 1.7.1 | Iceberg extensions for Spark |
 | `hadoop-azure` | 3.3.4 | ABFS driver for ADLS Gen2 |
-| Azure ADLS Gen2 | — | Parquet + metadata storage |
-| Snowflake | — | SQL read/write via Horizon catalog |
+| Azure ADLS Gen2 | — | Shared parquet + metadata storage |
+| Snowflake | — | AI analytics, BI, SQL read/write via Horizon catalog |
 
 ---
 
 ## Part 1 — Standing Up Polaris
 
-Polaris runs as a Docker container. The key bootstrap configuration is the realm name — in Polaris 1.5.0 the default realm is `POLARIS` (uppercase), not `default-realm`:
+Polaris runs as a Docker container with minimal configuration. The key bootstrap detail for Polaris 1.5.0 is that the default realm is `POLARIS` (uppercase):
 
 ```yaml
 # docker-compose.yml (excerpt)
@@ -77,22 +79,22 @@ environment:
   AZURE_TENANT_ID: ${AZURE_TENANT_ID}
 ```
 
-The Azure service principal credentials on the Polaris container are what enable **credential vending** — Polaris uses them to mint short-lived SAS tokens on behalf of clients.
+The Azure service principal on the Polaris container is what enables **credential vending** — Polaris uses it to mint short-lived scoped SAS tokens for every client that requests table access. Clients — including Snowflake — never hold long-lived storage credentials.
 
-[`setup/01_setup_polaris.py`](https://github.com/venkatmedida/iceberg-polaris-lakehouse/blob/main/setup/01_setup_polaris.py) bootstraps the catalog via the Polaris Management API: creates the catalog, namespace, and a service principal, then writes the generated `POLARIS_CLIENT_ID` and `POLARIS_CLIENT_SECRET` back to `.env`.
+[`setup/01_setup_polaris.py`](https://github.com/venkatmedida/iceberg-polaris-lakehouse/blob/main/setup/01_setup_polaris.py) bootstraps the catalog via the Polaris Management API: creates the catalog, namespace, and a dedicated service principal for client access.
 
 ```bash
-make up      # starts Polaris + Postgres
-make setup   # bootstraps catalog, namespace, principal
+make up      # start Polaris + Postgres
+make setup   # bootstrap catalog, namespace, service principal
 ```
 
 ---
 
-## Part 2 — Writing Iceberg Data with Spark
+## Part 2 — Spark Writes Data That Snowflake Will Analyze
+
+Spark handles ingestion and feature engineering — the classic data engineering role. Each write creates a new Iceberg snapshot in Polaris that Snowflake can immediately query.
 
 ### SparkSession Configuration
-
-The session wires up the Polaris REST catalog as a named Spark catalog (`polaris`):
 
 ```python
 # spark_jobs/utils/spark_session.py (key configs)
@@ -104,7 +106,7 @@ The session wires up the Polaris REST catalog as a named Spark catalog (`polaris
 .config("spark.sql.catalog.polaris.warehouse", POLARIS_CATALOG_NAME)
 .config("spark.sql.catalog.polaris.oauth2-server-uri",
         f"{POLARIS_URI}/v1/oauth/tokens")
-# Force HadoopFileIO — avoids loading ADLSFileIO which requires Azure SDK v12
+# HadoopFileIO: avoids ADLSFileIO dependency on Azure SDK v12
 .config("spark.sql.catalog.polaris.io-impl",
         "org.apache.iceberg.hadoop.HadoopFileIO")
 # Snowflake writes parquet with DELTA_LENGTH_BYTE_ARRAY encoding;
@@ -112,38 +114,24 @@ The session wires up the Polaris REST catalog as a named Spark catalog (`polaris
 .config("spark.sql.iceberg.vectorization.enabled", "false")
 ```
 
-Two things worth noting:
+The vectorized reader config is critical for bidirectional use: Snowflake writes parquet files with `DELTA_LENGTH_BYTE_ARRAY` encoding for string columns, which Iceberg's own vectorized reader doesn't support. Disabling it allows Spark to read Snowflake-written files transparently.
 
-- **`io-impl = HadoopFileIO`**: Iceberg 1.7.1 ships `ADLSFileIO` which requires the Azure SDK v12 JAR. Without it, Iceberg logs a warning and falls back to `HadoopFileIO` for reads but throws `NoClassDefFoundError` in some code paths. Forcing `HadoopFileIO` explicitly avoids this entirely.
-- **Vectorized reader disabled**: Snowflake writes parquet files using `DELTA_LENGTH_BYTE_ARRAY` encoding for string columns. Iceberg's vectorized reader doesn't support this — disabling it allows Spark to read files written by either engine.
-
-### Writing Two Batches
+### Writing Feature Data
 
 ```python
 # spark_jobs/write_iceberg.py
 df.writeTo("polaris.demo.sales").append()
 ```
 
-Each `append()` call creates a new Iceberg snapshot in Polaris. After two batches, the table history shows:
-
-```
-+-------------------+-------------------+-----------------------+
-|snapshot_id        |parent_id          |made_current_at        |
-+-------------------+-------------------+-----------------------+
-|6831974958144570916|NULL               |2026-07-03 01:32:32    |
-|870807956582903017 |6831974958144570916|2026-07-03 01:32:33    |
-+-------------------+-------------------+-----------------------+
-```
+Each append creates a new Iceberg snapshot. The moment the snapshot is committed to Polaris, it's queryable from Snowflake — no pipeline, no delay.
 
 ```bash
 make write
 ```
 
----
+### Time Travel for Reproducible ML
 
-## Part 3 — Reading with Time Travel
-
-Spark can read the table at any previous snapshot — useful for reproducing historical pipeline outputs:
+Iceberg's time travel is natively available through Polaris:
 
 ```python
 # spark_jobs/read_iceberg.py
@@ -151,7 +139,7 @@ first_snap = spark.sql(f"SELECT snapshot_id FROM {TABLE}.history ORDER BY made_c
 spark.sql(f"SELECT * FROM {TABLE} VERSION AS OF {first_snap['snapshot_id']}").show()
 ```
 
-The `.history`, `.files`, `.manifests`, and `.snapshots` metadata tables all work through the Polaris REST catalog exactly as they would with any native Iceberg catalog.
+ML pipelines that need to reproduce a training dataset from a specific point in time can reference a snapshot ID — exact reproducibility regardless of subsequent writes by any engine.
 
 ```bash
 make read
@@ -159,14 +147,14 @@ make read
 
 ---
 
-## Part 4 — Iceberg Table Maintenance
+## Part 3 — Iceberg Table Maintenance
 
-Iceberg stored procedures in Spark handle all maintenance tasks:
+Polaris manages metadata; table maintenance (compaction, manifest rewriting, snapshot expiry) runs through Spark stored procedures:
 
 ```python
 # spark_jobs/maintenance.py
 
-# 1. Compact small files into target-size bins
+# Compact small files — critical for Snowflake query performance
 spark.sql(f"""
     CALL polaris.system.rewrite_data_files(
         table    => 'demo.sales',
@@ -175,10 +163,10 @@ spark.sql(f"""
     )
 """)
 
-# 2. Consolidate manifest files after many writes
+# Consolidate manifests after many incremental writes
 spark.sql("CALL polaris.system.rewrite_manifests(table => 'demo.sales', use_caching => true)")
 
-# 3. Expire old snapshots — keep last 5, drop anything older than 7 days
+# Expire old snapshots — keep last 5, drop older than 7 days
 cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 spark.sql(f"""
     CALL polaris.system.expire_snapshots(
@@ -188,14 +176,18 @@ spark.sql(f"""
     )
 """)
 
-# 4. Remove orphan files from failed or aborted writes
-spark.sql("CALL polaris.system.remove_orphan_files(table => 'demo.sales', older_than => ...)")
+# Remove orphan files from aborted writes
+spark.sql(f"""
+    CALL polaris.system.remove_orphan_files(
+        table      => 'demo.sales',
+        older_than => TIMESTAMP '{cutoff}'
+    )
+""")
 ```
 
-Two gotchas discovered during testing:
+Well-compacted files and clean manifests directly improve Snowflake's scan performance on the same table — maintenance done in Spark benefits Snowflake queries immediately.
 
-- `TIMESTAMPADD(DAY, -7, CURRENT_TIMESTAMP())` is MySQL/Snowflake syntax — Spark SQL rejects it. Use a Python-computed `TIMESTAMP 'yyyy-MM-dd HH:mm:ss'` literal instead.
-- `INTERVAL N DAYS` works in regular Spark SQL but the CALL procedure parser rejects expressions with parentheses — only literals are allowed in named procedure arguments.
+> **Gotcha**: Spark's CALL procedure parser only accepts literal values in named arguments — no function calls with parentheses. Compute timestamps in Python and embed them as `TIMESTAMP 'yyyy-MM-dd HH:mm:ss'` literals.
 
 ```bash
 make maintenance
@@ -203,7 +195,9 @@ make maintenance
 
 ---
 
-## Part 5 — Snowflake Catalog Integration
+## Part 4 — Snowflake as the AI Analytics Engine
+
+This is where the architecture pays off for organizations using Snowflake for AI and analytics workloads. Snowflake connects to Polaris through a **Catalog Integration** with `VENDED_CREDENTIALS` — no data movement, no staging, no ETL.
 
 ### How Credential Vending Works
 
@@ -219,15 +213,15 @@ make maintenance
 │              │                                 │   demo/tables/   │
 │              │◀────────────────────────────── │   sales          │
 │              │   table metadata                └──────────────────┘
-│              │   + adls.sas-token.*                  │
-│              │     (rawdl scope, 1h TTL)             │ Azure SDK
-│              │                                       ▼
+│              │   + adls.sas-token.*
+│              │     (rawdl scope, 1h TTL)
+│              │
 │              │   3. Read/write parquet   ┌──────────────────────┐
 │              │ ────────────────────────▶ │  Azure ADLS Gen2     │
-└──────────────┘   using SAS token         └──────────────────────┘
+└──────────────┘   directly via SAS token  └──────────────────────┘
 ```
 
-When `ACCESS_DELEGATION_MODE = VENDED_CREDENTIALS`, Snowflake sends `X-Iceberg-Access-Delegation: vended-credentials` on every table metadata request. Polaris responds with the table metadata **plus** a scoped Azure SAS token with `rawdl` permissions (read + add + write + delete + list). Snowflake uses this SAS token directly — **no external volume needed**.
+Snowflake sends `X-Iceberg-Access-Delegation: vended-credentials` on every table request. Polaris responds with table metadata plus a short-lived Azure SAS token with `sp=rawdl` permissions — read, add, **write**, delete, and list. **No external volume is required.** The Azure service principal lives only inside Polaris; Snowflake never holds a long-lived storage credential.
 
 ### Catalog Integration
 
@@ -251,27 +245,27 @@ CREATE OR REPLACE CATALOG INTEGRATION polaris_catalog_int
   ENABLED = TRUE;
 ```
 
-Snowflake auto-resolves `OAUTH_TOKEN_URI` from the catalog's `GET /config` response — no need to specify it explicitly.
+Snowflake auto-resolves the OAuth token endpoint from the catalog's `GET /config` response — no need to specify it explicitly.
 
-### Linked Database — Auto-Discovery
+### Linked Database — Snowflake Auto-Discovers Everything
 
-The correct syntax for a true linked database (schemas and tables auto-discovered from Polaris) is `LINKED_CATALOG`, not `CATALOG =`:
+The `LINKED_CATALOG` syntax triggers a background sync: Snowflake calls Polaris's namespace and table listing APIs and surfaces every namespace as a Snowflake schema — automatically, without manual `CREATE ICEBERG TABLE` statements:
 
 ```sql
--- CORRECT — schemas and tables appear automatically
+-- schemas and tables from Polaris appear in Snowflake automatically
 CREATE OR REPLACE DATABASE polaris_linked_db
   LINKED_CATALOG = (
     CATALOG            = 'polaris_catalog_int'
     BLOCKED_NAMESPACES = ('information_schema')
   );
 
--- Check sync status
+-- monitor sync (typically completes in ~30s)
 SELECT SYSTEM$CATALOG_LINK_STATUS('polaris_linked_db');
--- {"executionState":"RUNNING"} → sync in progress
--- After ~30s: demo schema and sales table appear automatically
+-- {"executionState":"RUNNING"} → in progress
+-- {"executionState":"DONE"}    → demo schema and sales table are live
 ```
 
-`CREATE DATABASE ... CATALOG = '...'` (without `LINKED_CATALOG`) creates a catalog-backed database where schemas must be registered manually. `LINKED_CATALOG` triggers a background sync that calls Polaris's namespace and table listing APIs and surfaces every namespace as a Snowflake schema.
+Once the sync completes, Snowflake analysts can immediately run SQL on data written by Spark, Python, or any other Iceberg-compatible engine — with no awareness that the data originated outside Snowflake.
 
 ```bash
 make sf-setup
@@ -279,31 +273,67 @@ make sf-setup
 
 ---
 
-## Part 6 — Bidirectional Writes
+## Part 5 — Snowflake Reads, Writes, and Updates
 
-The full test script ([`setup/03_snowflake_read_write_test.sql`](https://github.com/venkatmedida/iceberg-polaris-lakehouse/blob/main/setup/03_snowflake_read_write_test.sql)) proves every direction:
+The [`setup/03_snowflake_read_write_test.sql`](https://github.com/venkatmedida/iceberg-polaris-lakehouse/blob/main/setup/03_snowflake_read_write_test.sql) script validates every direction of the interoperability:
+
+### Reading Spark-Written Data
 
 ```sql
--- Phase 1: Snowflake reads Spark-written rows
+-- Snowflake immediately sees all rows written by Spark
 SELECT * FROM polaris_linked_db.demo.sales ORDER BY order_date, order_id;
--- 6 rows from Spark ✓
+-- 6 rows (ORD-001 … ORD-006) ✓
 
--- Phase 2: Snowflake inserts
-INSERT INTO polaris_linked_db.demo.sales VALUES ('ORD-SF-001', ...);
+SELECT
+    order_date,
+    COUNT(*)    AS orders,
+    SUM(amount) AS total_revenue
+FROM polaris_linked_db.demo.sales
+GROUP BY order_date
+ORDER BY order_date;
+```
 
--- Phase 3: Snowflake reads its own write
-SELECT COUNT(*) FROM polaris_linked_db.demo.sales;
--- 9 rows (6 Spark + 3 Snowflake) ✓
+For AI analytics use cases, this means Snowflake can run feature queries, aggregations, or Cortex AI functions on data that a Spark feature pipeline just committed — in the same transaction boundary, no delay.
 
--- Phase 5: Snowflake updates a Spark-written row
+### Snowflake Writing Back
+
+```sql
+-- Snowflake inserts create new Iceberg snapshots in Polaris
+INSERT INTO polaris_linked_db.demo.sales
+VALUES ('ORD-SF-001', 'CUST-SF', 'Cloud Widget', 5, 149.95, CURRENT_DATE());
+
+INSERT INTO polaris_linked_db.demo.sales VALUES
+    ('ORD-SF-002', 'CUST-A', 'Cloud Widget Pro',  3, 299.85, CURRENT_DATE()),
+    ('ORD-SF-003', 'CUST-B', 'Snowflake Gadget',  1,  89.99, CURRENT_DATE());
+
+-- 9 rows total (6 Spark + 3 Snowflake)
+SELECT COUNT(*) AS total_rows FROM polaris_linked_db.demo.sales;
+```
+
+Snowflake-written rows are visible to Spark immediately after the INSERT commits. This enables write-back patterns for AI workloads: Snowflake Cortex computes predictions or scores and writes them back to the Iceberg table, where Spark pipelines pick them up for the next training cycle.
+
+### Cross-Engine MERGE
+
+```sql
+-- Snowflake updates a row originally written by Spark
 MERGE INTO polaris_linked_db.demo.sales AS target
-USING (...) AS source
+USING (
+    SELECT 'ORD-001' AS order_id, 'Widget Pro' AS product,
+           10 AS quantity, 249.90 AS amount
+) AS source
 ON target.order_id = source.order_id
-WHEN MATCHED THEN UPDATE SET quantity = 10, amount = 249.90;
+WHEN MATCHED THEN UPDATE SET quantity = source.quantity, amount = source.amount
+WHEN NOT MATCHED THEN INSERT (...) VALUES (...);
 -- 0 inserted, 1 updated ✓
 ```
 
-After running the Snowflake script, re-running `make read` from Spark confirms:
+```bash
+make sf-test
+```
+
+### Spark Confirms It Sees Everything
+
+After the Snowflake script runs, `make read` from Spark shows the complete picture:
 
 ```
 +----------+-----------+----------------+--------+------+----------+
@@ -318,34 +348,47 @@ After running the Snowflake script, re-running `make read` from Spark confirms:
 +----------+-----------+----------------+--------+------+----------+
 ```
 
-The snapshot history shows exactly 8 entries — each engine's commit is a first-class Iceberg snapshot that the other engine can time-travel to.
+The snapshot history shows 8 entries — each engine's commit is a first-class Iceberg snapshot. Spark can time-travel to any Snowflake snapshot; Snowflake can reference any Spark snapshot.
 
 ```bash
-make sf-test   # Snowflake bidirectional test
-make read      # Spark confirms it sees Snowflake's commits
+make read    # Spark confirms all 9 rows including Snowflake's commits
 ```
+
+---
+
+## What This Means for AI Analytics on Snowflake
+
+The architectural pattern demonstrated here has direct implications for organizations building AI pipelines with Snowflake at the center:
+
+**Feature stores without data duplication.** Feature engineering pipelines running on Spark write computed features directly to an Iceberg table in Polaris. Snowflake Cortex or ML models running inside Snowflake query those features from the same table — no copy, no sync, no staleness.
+
+**Model inference write-back.** Snowflake Cortex generates predictions and writes them as new rows or updates to an Iceberg table in Polaris. Downstream Spark jobs pick up those predictions for retraining, evaluation, or further pipeline stages — from the same table, with full snapshot history.
+
+**Unified governance.** Because Polaris is the single catalog, access control, schema evolution, and table lifecycle are managed in one place. Snowflake's RBAC and Polaris's principal role model can be layered to enforce consistent data governance regardless of which engine writes the data.
+
+**Cost-optimized compute.** Heavy transformation and ingestion runs on Spark (cheaper for large-scale processing); interactive analytics, dashboards, and AI inference run on Snowflake (optimized for concurrency and SQL). Neither engine needs to know about the other's internal mechanics — they both speak Iceberg through Polaris.
 
 ---
 
 ## Key Learnings
 
-**1. Realm name matters at bootstrap**
-Polaris 1.5.0's default realm is `POLARIS` (uppercase). Using `default-realm` in `POLARIS_BOOTSTRAP_CREDENTIALS` causes silent `unauthorized_client` errors. Check Polaris logs — every log line includes the realm in brackets: `[requestId,POLARIS]`.
+**1. `LINKED_CATALOG` is the right Snowflake syntax**
+`CREATE DATABASE ... CATALOG = '...'` creates a catalog-backed database where schemas must be registered manually. `LINKED_CATALOG = (CATALOG = '...')` triggers background auto-discovery of all Polaris namespaces and tables. Use `SYSTEM$CATALOG_LINK_STATUS('db_name')` to monitor sync completion.
 
-**2. Polaris 1.5.0 field names changed**
-`AzureStorageConfigInfo` uses `tenantId` not `azureTenantId`. The management API returns HTTP 400 with an empty body if you use the old field name. Inspect the deployed JAR with Python's `zipfile` module if the API rejects requests without a useful error.
+**2. Credential vending supports writes — no external volume needed**
+With `ACCESS_DELEGATION_MODE = VENDED_CREDENTIALS`, Polaris mints SAS tokens with `sp=rawdl` scope (read + add + write + delete + list). Snowflake reads the table's base location from Polaris metadata and writes parquet files directly to ADLS. `SHOW ICEBERG TABLES` confirms: `external_volume_name: <invalid>`, `can_write_metadata: Y`.
 
-**3. `HadoopFileIO` over `ADLSFileIO` for Spark**
-`ADLSFileIO` requires `azure-storage-file-datalake` SDK v12. Adding that JAR pulls in `DefaultAzureCredential` which tries multiple auth methods and fails loudly. Explicitly setting `io-impl = org.apache.iceberg.hadoop.HadoopFileIO` avoids the entire issue — the ABFS driver handles Azure auth through standard Spark Hadoop config.
+**3. Disable Iceberg's vectorized reader for cross-engine tables**
+Snowflake writes parquet with `DELTA_LENGTH_BYTE_ARRAY` encoding. Iceberg's own vectorized reader (`spark.sql.iceberg.vectorization.enabled=false`) doesn't support it — disabling it (distinct from `spark.sql.parquet.enableVectorizedReader`) allows Spark to read Snowflake-written files without errors.
 
-**4. Iceberg CALL procedure syntax is strict**
-Stored procedure arguments must be literals — no function calls with parentheses (so no `CAST(...)`, no `INTERVAL N DAYS`). Compute timestamps in Python and embed them as `TIMESTAMP 'yyyy-MM-dd HH:mm:ss'` literals.
+**4. Spark CALL procedures require literal timestamps**
+Named procedure arguments in Spark's CALL parser don't accept function calls with parentheses. Compute timestamps in Python and embed as `TIMESTAMP 'yyyy-MM-dd HH:mm:ss'` literals.
 
-**5. Credential vending supports writes on Azure**
-The Polaris-vended SAS token has `sp=rawdl` scope — read, add, **write**, delete, list. No external volume is needed in Snowflake when using `ACCESS_DELEGATION_MODE = VENDED_CREDENTIALS`. The Azure service principal lives only inside Polaris, and clients get short-lived scoped tokens per request.
+**5. Compaction in Spark improves Snowflake query performance**
+Running `rewrite_data_files` in Spark (targeting 128 MB files) reduces the number of parquet files Snowflake must scan per query — maintenance done in one engine benefits all engines.
 
-**6. `LINKED_CATALOG` vs `CATALOG =`**
-`CREATE DATABASE ... CATALOG = '...'` does not auto-discover schemas — it creates a catalog-backed database where tables must be registered manually. The correct syntax for a linked database that mirrors Polaris is `LINKED_CATALOG = (CATALOG = '...')`.
+**6. Polaris realm name in 1.5.0**
+The default realm is `POLARIS` (uppercase), not `default-realm`. Using the wrong realm causes silent `unauthorized_client` errors. Every Polaris log line includes the realm in brackets: `[requestId,POLARIS]`.
 
 ---
 
@@ -354,21 +397,19 @@ The Polaris-vended SAS token has `sp=rawdl` scope — read, add, **write**, dele
 ```bash
 git clone https://github.com/venkatmedida/iceberg-polaris-lakehouse
 cd iceberg-polaris-lakehouse
-cp .env.example .env   # fill in your credentials
+cp .env.example .env   # fill in your Azure + Polaris credentials
 
 make up          # start Polaris (Docker)
-make setup       # bootstrap catalog + principal
-make write       # Spark writes 6 rows in 2 batches
-make read        # Spark reads with time travel + metadata
-make maintenance # compact, rewrite manifests, expire snapshots
+make setup       # bootstrap catalog + service principal
+make write       # Spark writes feature data (6 rows, 2 snapshots)
+make read        # Spark reads with time travel + metadata tables
+make maintenance # compact files, rewrite manifests, expire snapshots
 
-# Snowflake (requires snow CLI + ngrok)
-ngrok http 8181              # get public URL → set POLARIS_PUBLIC_HOST in .env
+# Connect Snowflake (requires snow CLI + ngrok for local Polaris)
+ngrok http 8181              # expose Polaris publicly → set POLARIS_PUBLIC_HOST
 make sf-setup                # create catalog integration + linked database
-make sf-test                 # bidirectional read/write test
-make read                    # Spark sees Snowflake's commits
+make sf-test                 # bidirectional read/write/merge test
+make read                    # Spark confirms it sees all Snowflake snapshots
 ```
 
----
-
-*Full source: [github.com/venkatmedida/iceberg-polaris-lakehouse](https://github.com/venkatmedida/iceberg-polaris-lakehouse)*
+Full source: **[github.com/venkatmedida/iceberg-polaris-lakehouse](https://github.com/venkatmedida/iceberg-polaris-lakehouse)**
