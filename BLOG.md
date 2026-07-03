@@ -372,19 +372,17 @@ The architectural pattern demonstrated here has direct implications for organiza
 
 ## Key Learnings
 
-**1. `LINKED_CATALOG` is the right Snowflake syntax**
-`CREATE DATABASE ... CATALOG = '...'` creates a catalog-backed database where schemas must be registered manually. `LINKED_CATALOG = (CATALOG = '...')` triggers background auto-discovery of all Polaris namespaces and tables. Use `SYSTEM$CATALOG_LINK_STATUS('db_name')` to monitor sync completion.
 
-**2. Credential vending supports writes — no external volume needed**
+**1. Credential vending supports writes — no external volume needed**
 With `ACCESS_DELEGATION_MODE = VENDED_CREDENTIALS`, Polaris mints SAS tokens with `sp=rawdl` scope (read + add + write + delete + list). Snowflake reads the table's base location from Polaris metadata and writes parquet files directly to ADLS. `SHOW ICEBERG TABLES` confirms: `external_volume_name: <invalid>`, `can_write_metadata: Y`.
 
-**3. Disable Iceberg's vectorized reader for cross-engine tables**
+**2. Disable Iceberg's vectorized reader for cross-engine tables**
 Snowflake writes parquet with `DELTA_LENGTH_BYTE_ARRAY` encoding. Iceberg's own vectorized reader (`spark.sql.iceberg.vectorization.enabled=false`) doesn't support it — disabling it (distinct from `spark.sql.parquet.enableVectorizedReader`) allows Spark to read Snowflake-written files without errors.
 
-**4. Spark CALL procedures require literal timestamps**
+**3. Spark CALL procedures require literal timestamps**
 Named procedure arguments in Spark's CALL parser don't accept function calls with parentheses. Compute timestamps in Python and embed as `TIMESTAMP 'yyyy-MM-dd HH:mm:ss'` literals.
 
-**5. Compaction in Spark improves Snowflake query performance**
+**4. Compaction in Spark improves Snowflake query performance**
 Running `rewrite_data_files` in Spark (targeting 128 MB files) reduces the number of parquet files Snowflake must scan per query — maintenance done in one engine benefits all engines.
 
 **6. Polaris realm name in 1.5.0**
