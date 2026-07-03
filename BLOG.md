@@ -451,3 +451,20 @@ spark-submit \
 ```
 
 Full source: **[github.com/venkatmedida/iceberg-polaris-lakehouse](https://github.com/venkatmedida/iceberg-polaris-lakehouse)**
+
+---
+
+## Summary
+
+This post walked through building an open lakehouse where Spark and Snowflake share the same Iceberg table — no data duplication, no ETL pipelines, no sync jobs.
+
+Here is what it covered:
+
+- **Apache Polaris 1.5.0** as a self-hosted Iceberg REST catalog running in Docker, acting as the single source of truth for table metadata and snapshots across all engines
+- **PySpark** writing feature data and running Iceberg table maintenance (compaction, manifest rewriting, snapshot expiry) — with every commit immediately visible to Snowflake
+- **Snowflake Horizon Catalog Integration** using `VENDED_CREDENTIALS` — Polaris mints short-lived Azure SAS tokens so Snowflake can read and write directly to ADLS without an external volume or long-lived storage credentials
+- **`LINKED_CATALOG`** syntax for true auto-discovery — Snowflake syncs all Polaris namespaces and tables as native Snowflake schemas and tables automatically
+- **Bidirectional read/write/merge** validated end-to-end: Snowflake reads Spark-written rows, inserts new rows, runs a MERGE update on a Spark-written record, and Spark confirms it sees every Snowflake commit as a first-class Iceberg snapshot
+- **AI analytics implications** — how this pattern enables zero-copy feature stores, Snowflake Cortex inference write-back, unified governance, and cost-optimized compute split between Spark and Snowflake
+
+The result is a platform where your data engineering team writes in Spark, your analysts and AI workloads run in Snowflake, and neither engine needs to know or care what the other is doing — Polaris handles it all through the open Iceberg REST standard.
