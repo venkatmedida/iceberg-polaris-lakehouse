@@ -1,0 +1,14 @@
+# ── PySpark runtime ───────────────────────────────────────────────
+# Iceberg JARs are resolved at runtime via spark.jars.packages;
+# see spark_jobs/utils/spark_session.py and the Makefile.
+pyspark==3.5.3
+
+# ── Polaris setup script ──────────────────────────────────────────
+requests==2.32.3
+python-dotenv==1.0.1
+
+# ── Snowflake connector (for 02_setup_snowflake.py helper) ───────
+snowflake-connector-python==3.12.2
+
+# ── Optional: PyIceberg for Python-native catalog inspection ─────
+# pyiceberg[pyarrow,azure]==0.8.0

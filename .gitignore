@@ -1,0 +1,30 @@
+# Credentials — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Spark / Java
+derby.log
+metastore_db/
+spark-warehouse/
+*.class
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# ngrok
+ngrok.log

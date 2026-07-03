@@ -1,0 +1,61 @@
+version: "3.8"
+
+# ----------------------------------------------------------------
+# Dev stack: Apache Polaris (Iceberg REST catalog) + PostgreSQL
+# For production, replace postgres with a managed DB and expose
+# Polaris behind a load balancer with TLS.
+# ----------------------------------------------------------------
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: polaris
+      POSTGRES_USER: polaris
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polaris"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  polaris:
+    image: apache/polaris:latest
+    ports:
+      - "8181:8181"   # REST catalog + management API
+      - "8182:8182"   # Admin / health
+    environment:
+      # Bootstrap root principal: realm,clientId,clientSecret
+      # Realm must match Polaris default realm (POLARIS in 1.5.0)
+      POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,${POLARIS_ROOT_CLIENT_ID},${POLARIS_ROOT_CLIENT_SECRET}"
+
+      # Persistence — switch from in-memory to PostgreSQL
+      QUARKUS_DATASOURCE_DB_KIND: postgresql
+      QUARKUS_DATASOURCE_USERNAME: polaris
+      QUARKUS_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://postgres:5432/polaris"
+
+      # Azure Service Principal used by Polaris for credential vending.
+      # Polaris generates scoped SAS tokens so Spark never holds long-lived ADLS keys.
+      AZURE_CLIENT_ID: ${AZURE_POLARIS_CLIENT_ID}
+      AZURE_CLIENT_SECRET: ${AZURE_POLARIS_CLIENT_SECRET}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID}
+
+      # Log level — set to DEBUG when troubleshooting auth / credential vending
+      QUARKUS_LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8182/healthcheck || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  postgres_data:
