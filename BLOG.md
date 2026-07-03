@@ -84,8 +84,8 @@ The Azure service principal on the Polaris container is what enables **credentia
 [`setup/01_setup_polaris.py`](https://github.com/venkatmedida/iceberg-polaris-lakehouse/blob/main/setup/01_setup_polaris.py) bootstraps the catalog via the Polaris Management API: creates the catalog, namespace, and a dedicated service principal for client access.
 
 ```bash
-make up      # start Polaris + Postgres
-make setup   # bootstrap catalog, namespace, service principal
+docker compose up -d        # start Polaris + Postgres
+python setup/01_setup_polaris.py   # bootstrap catalog, namespace, service principal
 ```
 
 ---
@@ -126,7 +126,10 @@ df.writeTo("polaris.demo.sales").append()
 Each append creates a new Iceberg snapshot. The moment the snapshot is committed to Polaris, it's queryable from Snowflake — no pipeline, no delay.
 
 ```bash
-make write
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/write_iceberg.py
 ```
 
 ### Time Travel for Reproducible ML
@@ -142,7 +145,10 @@ spark.sql(f"SELECT * FROM {TABLE} VERSION AS OF {first_snap['snapshot_id']}").sh
 ML pipelines that need to reproduce a training dataset from a specific point in time can reference a snapshot ID — exact reproducibility regardless of subsequent writes by any engine.
 
 ```bash
-make read
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/read_iceberg.py
 ```
 
 ---
@@ -190,7 +196,10 @@ Well-compacted files and clean manifests directly improve Snowflake's scan perfo
 > **Gotcha**: Spark's CALL procedure parser only accepts literal values in named arguments — no function calls with parentheses. Compute timestamps in Python and embed them as `TIMESTAMP 'yyyy-MM-dd HH:mm:ss'` literals.
 
 ```bash
-make maintenance
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/maintenance.py
 ```
 
 ---
@@ -268,7 +277,7 @@ SELECT SYSTEM$CATALOG_LINK_STATUS('polaris_linked_db');
 Once the sync completes, Snowflake analysts can immediately run SQL on data written by Spark, Python, or any other Iceberg-compatible engine — with no awareness that the data originated outside Snowflake.
 
 ```bash
-make sf-setup
+snow sql -c MJ07903 -f setup/02b_snowflake_catalog_linked_db.sql
 ```
 
 ---
@@ -328,12 +337,12 @@ WHEN NOT MATCHED THEN INSERT (...) VALUES (...);
 ```
 
 ```bash
-make sf-test
+snow sql -c MJ07903 -f setup/03_snowflake_read_write_test.sql
 ```
 
 ### Spark Confirms It Sees Everything
 
-After the Snowflake script runs, `make read` from Spark shows the complete picture:
+After the Snowflake script runs, re-running the Spark read job shows the complete picture:
 
 ```
 +----------+-----------+----------------+--------+------+----------+
@@ -351,7 +360,11 @@ After the Snowflake script runs, `make read` from Spark shows the complete pictu
 The snapshot history shows 8 entries — each engine's commit is a first-class Iceberg snapshot. Spark can time-travel to any Snowflake snapshot; Snowflake can reference any Spark snapshot.
 
 ```bash
-make read    # Spark confirms all 9 rows including Snowflake's commits
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/read_iceberg.py
+# Spark confirms all 9 rows including Snowflake's commits
 ```
 
 ---
@@ -397,17 +410,44 @@ git clone https://github.com/venkatmedida/iceberg-polaris-lakehouse
 cd iceberg-polaris-lakehouse
 cp .env.example .env   # fill in your Azure + Polaris credentials
 
-make up          # start Polaris (Docker)
-make setup       # bootstrap catalog + service principal
-make write       # Spark writes feature data (6 rows, 2 snapshots)
-make read        # Spark reads with time travel + metadata tables
-make maintenance # compact files, rewrite manifests, expire snapshots
+# Start Polaris (Docker)
+docker compose up -d
+
+# Bootstrap catalog + service principal
+python setup/01_setup_polaris.py
+
+# Spark writes feature data (6 rows, 2 snapshots)
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/write_iceberg.py
+
+# Spark reads with time travel + metadata tables
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/read_iceberg.py
+
+# Compact files, rewrite manifests, expire snapshots
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/maintenance.py
 
 # Connect Snowflake (requires snow CLI + ngrok for local Polaris)
-ngrok http 8181              # expose Polaris publicly → set POLARIS_PUBLIC_HOST
-make sf-setup                # create catalog integration + linked database
-make sf-test                 # bidirectional read/write/merge test
-make read                    # Spark confirms it sees all Snowflake snapshots
+ngrok http 8181   # expose Polaris publicly → set POLARIS_PUBLIC_HOST in .env
+
+# Create catalog integration + linked database
+snow sql -c MJ07903 -f setup/02b_snowflake_catalog_linked_db.sql
+
+# Bidirectional read/write/merge test
+snow sql -c MJ07903 -f setup/03_snowflake_read_write_test.sql
+
+# Spark confirms it sees all Snowflake snapshots
+spark-submit \
+  --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-azure:3.3.4 \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  spark_jobs/read_iceberg.py
 ```
 
 Full source: **[github.com/venkatmedida/iceberg-polaris-lakehouse](https://github.com/venkatmedida/iceberg-polaris-lakehouse)**
